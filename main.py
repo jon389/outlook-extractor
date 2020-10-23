@@ -12,11 +12,14 @@ def read_msgs():
     recent_5_msgs = []
     # inbox.Items is a 1-index collection, ordered from oldest->newest
     for i in range(inbox.Items.Count, inbox.Items.Count-5, -1):
-        message = inbox.Items[i]
-        deets = dict(SentDt=f'{message.SentOn:%Y-%m-%d %H:%M:%S}',
-                     Sender=message.Sender.Name,
-                     To=message.To,
-                     Subject=message.Subject
+        mailitem = inbox.Items[i]
+        # https://docs.microsoft.com/en-us/dotnet/api/microsoft.office.interop.outlook.mailitem
+        deets = dict(To=mailitem.To,
+                     From=mailitem.Sender.Name,
+                     Subject=mailitem.Subject,
+                     # SentDt=f'{mailitem.SentOn:%Y-%m-%d %H:%M:%S}',
+                     Received=f'{mailitem.ReceivedTime:%Y-%m-%d %H:%M:%S}',
+                     Size=mailitem.Size
                      )
         log.info(deets)
         recent_5_msgs.append(deets)
