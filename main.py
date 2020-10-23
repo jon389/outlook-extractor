@@ -2,6 +2,7 @@ import pandas as pd, numpy as np, xlwings as xw
 import win32com.client
 from win32com.client import constants
 from datetime import datetime
+from log_conf import logger as log
 
 
 def read_msgs():
@@ -17,7 +18,7 @@ def read_msgs():
                      To=message.To,
                      Subject=message.Subject
                      )
-        print(deets)
+        log.info(deets)
         recent_5_msgs.append(deets)
 
 
