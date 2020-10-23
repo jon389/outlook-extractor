@@ -1,0 +1,16 @@
+name: outlook-extractor
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - pip
+  - numpy
+  - pandas
+  - python-dateutil
+  - pytz
+  - pywin32
+  - xlwings
+  - alembic         # for dataset, so conda installs deps not pip
+  - sqlalchemy      # for dataset
+  - pip:
+    - dataset
