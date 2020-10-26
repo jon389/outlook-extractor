@@ -1,7 +1,10 @@
 import logging.config, time, datetime, pathlib
 
 proj_name = pathlib.Path(__file__).parent.name  # parent directory
-logfilename = pathlib.Path(__file__).parent / 'logs' / f'{proj_name}_{datetime.datetime.now():%Y-%m-%d_%H%M%S}.log'
+logs_folder = pathlib.Path(__file__).parent / 'logs'
+if not logs_folder.exists():
+    logs_folder.mkdir()
+logfilename = logs_folder / f'{proj_name}_{datetime.datetime.now():%Y-%m-%d_%H%M%S}.log'
 
 
 class UTCFormatter(logging.Formatter):
