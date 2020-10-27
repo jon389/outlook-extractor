@@ -6,6 +6,7 @@ dependencies:
   - pip
   - numpy
   - pandas
+  - xlrd
   - python-dateutil
   - pytz
   - pywin32
