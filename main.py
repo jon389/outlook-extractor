@@ -42,7 +42,7 @@ def parse_mock_attachment_to_db(mailitem, attachment_name: str, attachment_temp_
 
     expected_data_cols = dict(
         datetime='Date'.split(),
-        meta='first_name last_name email gender ip_address'.split(),
+        meta='first_name last_name emailID gender ip_address'.split(),
         decimal='GST PST HST JST KST'.split(),
         other='Comment'.split(),
     )
@@ -76,14 +76,21 @@ def parse_mock_attachment_to_db(mailitem, attachment_name: str, attachment_temp_
         ))
 
         attach_data = pd.read_excel(attachment_temp_filename,
-                                    parse_dates=['Date'])
+                                    parse_dates=['Date'],
+                                    dtype={meta: str for meta in
+                                           (expected_data_cols['meta'] + expected_data_cols['other'])},
+                                    ).assign(
+            Comment=lambda d: d.Comment.fillna('').astype(str)  # otherwise dataset creates as a float column
+        )
         # check data consistency
         #   eg. expected columns exist
         assert all(col in attach_data for col in expected_data_cols_all)
         #   eg. Date col is parsed as a date
         assert 'datetime' in str(attach_data['Date'].dtype)
-        #   eg. that input data has unique (Date, email)
-        if attach_data.duplicated('Date email'.split()).any():
+        # strip all strings, slow because applies func to each element
+        attach_data.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+        #   eg. that input data has unique (Date, emailID)
+        if attach_data.duplicated('Date emailID'.split()).any():
             err_msg = f'data error, duplicate rows in {attachment_name}'
             log.error(err_msg)
             raise ValueError(err_msg)
@@ -95,19 +102,19 @@ def parse_mock_attachment_to_db(mailitem, attachment_name: str, attachment_temp_
         for idx, row in attach_data.iterrows():
             already_exists = next(data_table.find(
                 Date=row['Date'],
-                email=row['email'],
+                email=row['emailID'],
                 order_by=['-ParseTimestampUTC']
             ), None)
 
             has_data_revision = False
             if already_exists:
-                log.debug(f'data row Date {row["Date"]:%Y-%m-%d} {row["email"]} already exist')
+                # log.debug(f'data row Date {row["Date"]:%Y-%m-%d} {row["emailID"]} already exist')
                 if not (all(already_exists[meta] == (row[meta] if pd.notna(row[meta]) else None)
                             for meta in (expected_data_cols['meta'] + expected_data_cols['other'])) and
                         all(round(already_exists[num],2)==round(row[num],2)
                             for num in expected_data_cols['decimal'])
                 ):
-                    log.debug(f'detected data revision {row["Date"]:%Y-%m-%d} {row["email"]}\n'
+                    log.debug(f'detected data revision {row["Date"]:%Y-%m-%d} {row["emailID"]}\n'
                         + 'DB '     + (','.join(f'{col}:{already_exists[col]}' for col in expected_data_cols_all))
                         + ' email ' + (','.join(f'{col}:{row[col]}' for col in expected_data_cols_all))
                     )
@@ -148,17 +155,20 @@ def read_msgs():
     # Body=mailitem.Body
     # Attachments=','.join(a.FileName for a in mailitem.Attachments)
     def check_email(mailitem):
-        log.debug(f'scanning email {mailitem.Sender.Name}|{mailitem.Subject:.40}|'
-                  f'{mailitem.ReceivedTime:%Y-%m-%d %H:%M:%S}')
-        if matched_attachments := match_mock_email(
-                From=mailitem.Sender.Name,
-                To=mailitem.To,
-                Subject=mailitem.Subject,
-                attached_filenames=[a.FileName for a in mailitem.Attachments]):
-            log.debug(
-                f'tagging email {mailitem.Sender.Name}|{mailitem.Subject:.40}|'
-                f'{mailitem.ReceivedTime:%Y-%m-%d %H:%M:%S}')
-            found_emails.append((mailitem, matched_attachments))
+        try:
+            log.debug(f'scanning email {mailitem.Sender.Name}|{mailitem.Subject:.40}|'
+                      f'{mailitem.ReceivedTime:%Y-%m-%d %H:%M:%S}')
+            if matched_attachments := match_mock_email(
+                    From=mailitem.Sender.Name,
+                    To=mailitem.To,
+                    Subject=mailitem.Subject,
+                    attached_filenames=[a.FileName for a in mailitem.Attachments]):
+                log.debug(
+                    f'tagging email {mailitem.Sender.Name}|{mailitem.Subject:.40}|'
+                    f'{mailitem.ReceivedTime:%Y-%m-%d %H:%M:%S}')
+                found_emails.append((mailitem, matched_attachments))
+        except:
+            pass
 
     # search within specific folders
     # - toplevel Inbox
