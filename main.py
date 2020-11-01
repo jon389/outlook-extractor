@@ -1,32 +1,90 @@
-import pandas as pd, numpy as np, xlwings as xw
 from pathlib import Path
-import win32com.client
-from win32com.client import constants
 from datetime import datetime
 from dateutil import tz
-import hashlib
-import dataset
-from log_conf import logger as log
+import os, shutil, win32com.client, hashlib
+from win32com.client import constants
+import pandas as pd, numpy as np, xlwings as xw
 
-save_attachments_temp = Path(__file__).parent / 'attachments_temp'
+from log_conf import logger as log, logs_folder
+
+save_attachments_temp = logs_folder.parent / 'attachments_temp'
 if not save_attachments_temp.exists():
     save_attachments_temp.mkdir()
 for f in save_attachments_temp.iterdir():  # delete all files
     f.unlink()
 
-mock_emails_db = Path(__file__).parent / 'parsed_mock_emails.db'
+try:
+    outlook = win32com.client.gencache.EnsureDispatch('Outlook.Application')
+except AttributeError:
+    shutil.rmtree(Path(os.environ['LOCALAPPDATA']) / 'gen_py', ignore_errors=True)
+    outlook = win32com.client.gencache.EnsureDispatch('Outlook.Application')
+
+
+expected_data_cols = dict(
+    datetime='Date'.split(),
+    meta='first_name last_name emailID gender ip_address'.split(),
+    decimal='GST 1,PST-3,HST,JST,KST'.split(','),
+    other='Comment'.split(),
+)
+expected_data_cols_all = [col for col_grp in expected_data_cols.values() for col in col_grp]
+
+
+def get_parsed_attachments_table() -> pd.DataFrame:
+    fname = save_attachments_temp.parent / f'parsed_attachments.csv'
+    if fname.exists():
+        return pd.read_csv(fname)
+    return pd.DataFrame()
+
+
+parsed_attachments = get_parsed_attachments_table()
+parsed_attach_data = pd.DataFrame()
 
 
 def match_mock_email(From: str, To: str, Subject: str, attached_filenames: list[str]) -> list[str]:
     if ('jon' in From.lower() and
             'jon' in To.lower() and
             'outlook' in Subject.lower() and 'extract' in Subject.lower()):
-        matched_attachments = [a for a in attached_filenames if ('mock' in a and 'attach' in a
-                                                                 and '.xls' in a)]  # matches xls, xlsx, xlsm, xlsb
+        matched_attachments = [a for a in attached_filenames if ('mock' in a.lower() and 'attach' in a.lower()
+                                                                 and '.xls' in a.lower())]  # matches xls, xlsx, xlsm, xlsb
         return matched_attachments
 
 
-def parse_mock_attachment_to_db(mailitem, attachment_name: str, attachment_temp_filename: str):
+def parse_mock_attachment_xls(attachment_name: str, attachment_temp_filename: Path) -> pd.DataFrame:
+
+    attach_data = pd.read_excel(attachment_temp_filename,
+                                parse_dates=['Date'],
+                                dtype={meta: str for meta in
+                                       (expected_data_cols['meta'] + expected_data_cols['other'])},
+                                ).assign(
+        Comment=lambda d: d.Comment.fillna('').astype(str)  # otherwise dataset creates as a float column
+    )
+    # check data consistency
+    #   eg. expected columns exist
+    assert all(col in attach_data for col in expected_data_cols_all)
+    #   eg. Date col is parsed as a date
+    assert 'datetime' in str(attach_data['Date'].dtype)
+    # strip all strings, slow because applies func to each element
+    attach_data.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+    #   eg. that input data has unique (Date, emailID)
+    if attach_data.duplicated('Date emailID'.split()).any():
+        err_msg = f'data error, duplicate rows in {attachment_name}'
+        log.error(err_msg)
+        raise ValueError(err_msg)
+
+    # use external key to map to row of ParsedEmails-> ParseTimestampUTC From Subject ReceivedTime Attachment
+    # don't insert duplicate data rows (ignoring ParseTimestampUTC)
+    #   Declare a unique constraint? on (<list of columns>).
+
+    # change column names to non-reserved names
+    attach_data = (attach_data[expected_data_cols_all]
+                   .rename(columns=lambda x: x.replace('-', '_').replace('.', '_'))
+                   .rename(columns={'Date': 'txDate'})
+                   )
+
+    return attach_data
+
+
+def parse_each_mock_attachment(mailitem, attachment_name: str, attachment_temp_filename: Path):
     # ParsedEmails Table
     # ParseTimestampUTC
     # mailitem: From Subject ReceivedTime Body
@@ -35,24 +93,16 @@ def parse_mock_attachment_to_db(mailitem, attachment_name: str, attachment_temp_
     # SelectedAttachmentHash
 
     # check if already parsed SelectedAttachment/SelectedAttachmentCheckSum
-
-    db = dataset.connect(f'sqlite:///{mock_emails_db}')
-    parsed_emails = db['ParsedEmails']
-    data_table = db['ParsedAttachmentData']
-
-    expected_data_cols = dict(
-        datetime='Date'.split(),
-        meta='first_name last_name emailID gender ip_address'.split(),
-        decimal='GST PST HST JST KST'.split(),
-        other='Comment'.split(),
-    )
-    expected_data_cols_all = [col for col_grp in expected_data_cols.values() for col in col_grp]
-
+    global parsed_attachments, parsed_attach_data
     parse_timestamp = datetime.utcnow()  # datetime.now(tz.tzlocal())
     attachment_hash = hashlib.sha1(open(attachment_temp_filename, 'rb').read()).hexdigest()
 
-    already_exists = next(parsed_emails.find(Attachment=attachment_name, AttachmentHash=attachment_hash), None)
-    if already_exists:
+    already_exists = parsed_attachments.query(
+        f'Attachment=="{attachment_name}" & AttachmentHash=="{attachment_hash}"'
+    ) if not parsed_attachments.empty else pd.DataFrame()
+
+    if not already_exists.empty:
+        already_exists = already_exists.iloc[0]
         log.info(f'ignoring {attachment_name} from {mailitem.Sender.Name}|{mailitem.Subject:.40}|'
                     f'{mailitem.ReceivedTime:%Y-%m-%d %H:%M}'
                  f' already in ParsedEmails table '
@@ -60,87 +110,58 @@ def parse_mock_attachment_to_db(mailitem, attachment_name: str, attachment_temp_
                  f'{already_exists["Received"]:%Y-%m-%d %H:%M}')
         return
 
-    db.begin()
     try:
-        parsed_emails.insert(dict(
+        attach_data = parse_mock_attachment_xls(attachment_name, attachment_temp_filename)
+        if attach_data.empty:
+            return
+
+        for idx, row in attach_data.iterrows():
+            has_data_revision = False
+            if not parsed_attach_data.empty:
+                data_query = (parsed_attach_data['txDate'] == row['txDate']) & \
+                             (parsed_attach_data['emailID'] == row['emailID'])
+                if data_query.any():
+                    data_exist = parsed_attach_data[data_query].sort_values('ParseTimestampUTC', ascending=False).iloc[0]
+
+                    # log.debug(f'data row txDate {row["txDate"]:%Y-%m-%d} {row["emailID"]} already exist')
+                    if not ( all(data_exist[meta] == (row[meta] if pd.notna(row[meta]) else None)
+                                 for meta in attach_data.select_dtypes(exclude='number').columns)
+                            and all(round(data_exist[num], 2) == round(row[num], 2)
+                                 for num  in attach_data.select_dtypes(include='number').columns)
+                    ):
+                        log.info(f'detected data revision {row["txDate"]:%Y-%m-%d} {row["emailID"]}'
+                            + '\nDB   :' + (','.join(f'{col}:{data_exist[col]}' for col in attach_data.columns))
+                            + '\nemail:' + (','.join(f'{col}:{row[col]}'        for col in attach_data.columns)) )
+                        has_data_revision = True
+
+            if parsed_attach_data.empty or not data_query.any() or has_data_revision:
+                parsed_attach_data = parsed_attach_data.append(dict(
+                    ParseTimestampUTC=parse_timestamp,
+                    Attachment=attachment_name,
+                    AttachmentHash=attachment_hash,
+                    **{col: row[col] for col in attach_data.columns},
+                    Revision=True if has_data_revision else None,
+                ), ignore_index=True)
+
+        parsed_attachments = parsed_attachments.append(dict(
             ParseTimestampUTC=parse_timestamp,
             To=mailitem.To,
             From=mailitem.Sender.Name,
             Subject=mailitem.Subject,
-            Received=mailitem.ReceivedTime,
+            Received=mailitem.ReceivedTime.replace(tzinfo=None),
             Size=mailitem.Size,
             Body=mailitem.Body,
             EmailAttachments=','.join(a.FileName for a in mailitem.Attachments),
             Attachment=attachment_name,
-            AttachmentHash=attachment_hash
-        ))
+            AttachmentHash=attachment_hash,
+        ), ignore_index=True)
 
-        attach_data = pd.read_excel(attachment_temp_filename,
-                                    parse_dates=['Date'],
-                                    dtype={meta: str for meta in
-                                           (expected_data_cols['meta'] + expected_data_cols['other'])},
-                                    ).assign(
-            Comment=lambda d: d.Comment.fillna('').astype(str)  # otherwise dataset creates as a float column
-        )
-        # check data consistency
-        #   eg. expected columns exist
-        assert all(col in attach_data for col in expected_data_cols_all)
-        #   eg. Date col is parsed as a date
-        assert 'datetime' in str(attach_data['Date'].dtype)
-        # strip all strings, slow because applies func to each element
-        attach_data.applymap(lambda x: x.strip() if isinstance(x, str) else x)
-        #   eg. that input data has unique (Date, emailID)
-        if attach_data.duplicated('Date emailID'.split()).any():
-            err_msg = f'data error, duplicate rows in {attachment_name}'
-            log.error(err_msg)
-            raise ValueError(err_msg)
-
-        # use external key to map to row of ParsedEmails-> ParseTimestampUTC From Subject ReceivedTime Attachment
-        # don't insert duplicate data rows (ignoring ParseTimestampUTC)
-        #   Declare a unique constraint? on (<list of columns>).
-        # data_cols = 'Date first_name last_name email gender ip_address GST PST HST JST KST Comment'
-        for idx, row in attach_data.iterrows():
-            already_exists = next(data_table.find(
-                Date=row['Date'],
-                email=row['emailID'],
-                order_by=['-ParseTimestampUTC']
-            ), None)
-
-            has_data_revision = False
-            if already_exists:
-                # log.debug(f'data row Date {row["Date"]:%Y-%m-%d} {row["emailID"]} already exist')
-                if not (all(already_exists[meta] == (row[meta] if pd.notna(row[meta]) else None)
-                            for meta in (expected_data_cols['meta'] + expected_data_cols['other'])) and
-                        all(round(already_exists[num],2)==round(row[num],2)
-                            for num in expected_data_cols['decimal'])
-                ):
-                    log.debug(f'detected data revision {row["Date"]:%Y-%m-%d} {row["emailID"]}\n'
-                        + 'DB '     + (','.join(f'{col}:{already_exists[col]}' for col in expected_data_cols_all))
-                        + ' email ' + (','.join(f'{col}:{row[col]}' for col in expected_data_cols_all))
-                    )
-                    has_data_revision = True
-
-            if not already_exists or has_data_revision:
-                data_table.insert(dict(
-                    ParseTimestampUTC=parse_timestamp,
-                    Attachment=attachment_name,
-                    AttachmentHash=attachment_hash,
-                    **{col: row[col] for col in expected_data_cols_all},
-                    Revision=True if has_data_revision else None,
-                ))
-
-        db.commit()
     except:
-        db.rollback()
         raise
 
 
-
-
-
 def read_msgs():
-    outlook = win32com.client.gencache.EnsureDispatch('Outlook.Application').GetNamespace('MAPI')
-    inbox = outlook.GetDefaultFolder(constants.olFolderInbox)
+    inbox = outlook.GetNamespace('MAPI').GetDefaultFolder(constants.olFolderInbox)
 
     scan_recent_msgs = 30
     found_emails = []
@@ -200,11 +221,17 @@ def read_msgs():
             found_attachments.append((mailitem, attachment_name, temp_name))
 
     log.debug(f'found {len(found_attachments)} attachments to parse')
+
     for found_attachment in sorted(found_attachments, key=lambda tup: tup[0].ReceivedTime):
         log.debug(f'parsing data from {found_attachment[1]} from {found_attachment[0].Sender.Name}|'
                   f'{found_attachment[0].Subject:.40}|{found_attachment[0].ReceivedTime:%Y-%m-%d %H:%M}')
-        parse_mock_attachment_to_db(*found_attachment)
+        parse_each_mock_attachment(*found_attachment)  # (mailitem, attachment_name, temp_name)
 
 
 if __name__ == '__main__':
     read_msgs()
+
+    parsed_attachments.to_csv(
+        save_attachments_temp.parent / f'parsed_attachments_{datetime.now():%Y-%m-%d_%H%M%S}.csv')
+    parsed_attach_data.to_csv(
+        save_attachments_temp.parent / f'parsed_data_{datetime.now():%Y-%m-%d_%H%M%S}.csv')

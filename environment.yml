@@ -4,14 +4,12 @@ channels:
   - defaults
 dependencies:
   - pip
+  - regex
   - numpy
   - pandas
   - xlrd
   - python-dateutil
   - pytz
+  - dateparser
   - pywin32
   - xlwings
-  - alembic         # for dataset, so conda installs deps not pip
-  - sqlalchemy      # for dataset
-  - pip:
-    - dataset
