@@ -4,6 +4,7 @@ from dateutil import tz
 import os, shutil, win32com.client, hashlib
 from win32com.client import constants
 import pandas as pd, numpy as np, xlwings as xw
+import dataset
 
 from log_conf import logger as log, logs_folder
 
@@ -51,13 +52,14 @@ def match_mock_email(From: str, To: str, Subject: str, attached_filenames: list[
 
 def parse_mock_attachment_xls(attachment_name: str, attachment_temp_filename: Path) -> pd.DataFrame:
 
-    attach_data = pd.read_excel(attachment_temp_filename,
-                                parse_dates=['Date'],
-                                dtype={meta: str for meta in
-                                       (expected_data_cols['meta'] + expected_data_cols['other'])},
-                                ).assign(
+    attach_data = pd.read_excel(
+        attachment_temp_filename,
+        parse_dates=['Date'],
+        dtype={meta: str for meta in (expected_data_cols['meta'] + expected_data_cols['other'])},
+        ).assign(
         Comment=lambda d: d.Comment.fillna('').astype(str)  # otherwise dataset creates as a float column
     )
+
     # check data consistency
     #   eg. expected columns exist
     assert all(col in attach_data for col in expected_data_cols_all)
@@ -77,7 +79,7 @@ def parse_mock_attachment_xls(attachment_name: str, attachment_temp_filename: Pa
 
     # change column names to non-reserved names
     attach_data = (attach_data[expected_data_cols_all]
-                   .rename(columns=lambda x: x.replace('-', '_').replace('.', '_'))
+                   .rename(columns=lambda x: x.replace('-', '_').replace('.', '_').replace(' ', '_'))
                    .rename(columns={'Date': 'txDate'})
                    )
 
@@ -94,6 +96,7 @@ def parse_each_mock_attachment(mailitem, attachment_name: str, attachment_temp_f
 
     # check if already parsed SelectedAttachment/SelectedAttachmentCheckSum
     global parsed_attachments, parsed_attach_data
+    new_attach_data = []
     parse_timestamp = datetime.utcnow()  # datetime.now(tz.tzlocal())
     attachment_hash = hashlib.sha1(open(attachment_temp_filename, 'rb').read()).hexdigest()
 
@@ -118,15 +121,16 @@ def parse_each_mock_attachment(mailitem, attachment_name: str, attachment_temp_f
         for idx, row in attach_data.iterrows():
             has_data_revision = False
             if not parsed_attach_data.empty:
-                data_query = (parsed_attach_data['txDate'] == row['txDate']) & \
+                data_query = (parsed_attach_data['txDate' ] == row['txDate' ]) & \
                              (parsed_attach_data['emailID'] == row['emailID'])
                 if data_query.any():
-                    data_exist = parsed_attach_data[data_query].sort_values('ParseTimestampUTC', ascending=False).iloc[0]
+                    data_exist = parsed_attach_data[data_query]\
+                        .sort_values('ParseTimestampUTC', ascending=False).iloc[0]
 
                     # log.debug(f'data row txDate {row["txDate"]:%Y-%m-%d} {row["emailID"]} already exist')
-                    if not ( all(data_exist[meta] == (row[meta] if pd.notna(row[meta]) else None)
+                    if not ( all(data_exist[meta] == row[meta]
                                  for meta in attach_data.select_dtypes(exclude='number').columns)
-                            and all(round(data_exist[num], 2) == round(row[num], 2)
+                         and all(round(data_exist[num], 2) == round(row[num], 2)
                                  for num  in attach_data.select_dtypes(include='number').columns)
                     ):
                         log.info(f'detected data revision {row["txDate"]:%Y-%m-%d} {row["emailID"]}'
@@ -135,14 +139,15 @@ def parse_each_mock_attachment(mailitem, attachment_name: str, attachment_temp_f
                         has_data_revision = True
 
             if parsed_attach_data.empty or not data_query.any() or has_data_revision:
-                parsed_attach_data = parsed_attach_data.append(dict(
+                new_attach_data.append(dict(
                     ParseTimestampUTC=parse_timestamp,
                     Attachment=attachment_name,
                     AttachmentHash=attachment_hash,
                     **{col: row[col] for col in attach_data.columns},
                     Revision=True if has_data_revision else None,
-                ), ignore_index=True)
+                ))
 
+        parsed_attach_data = pd.concat([parsed_attach_data, pd.DataFrame(new_attach_data)], ignore_index=True)
         parsed_attachments = parsed_attachments.append(dict(
             ParseTimestampUTC=parse_timestamp,
             To=mailitem.To,
