@@ -237,6 +237,9 @@ if __name__ == '__main__':
     read_msgs()
 
     parsed_attachments.to_csv(
-        save_attachments_temp.parent / f'parsed_attachments_{datetime.now():%Y-%m-%d_%H%M%S}.csv')
-    parsed_attach_data.to_csv(
-        save_attachments_temp.parent / f'parsed_data_{datetime.now():%Y-%m-%d_%H%M%S}.csv')
+        save_attachments_temp.parent / f'parsed_attachments_{datetime.now():%Y-%m-%d_%H%M%S}.csv', index=False)
+
+    # only return most recent revision (by ParseTimestampUTC), note parsing order is done by ReceivedTime order
+    parsed_attach_data.loc[parsed_attach_data.groupby('txDate emailID'.split())['ParseTimestampUTC'].idxmax()]\
+        .to_csv(save_attachments_temp.parent / f'parsed_data_{datetime.now():%Y-%m-%d_%H%M%S}.csv',
+                index=False)
