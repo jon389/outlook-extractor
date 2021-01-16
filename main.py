@@ -4,7 +4,7 @@ from dateutil import tz
 import os, shutil, win32com.client, hashlib
 from win32com.client import constants
 import pandas as pd, numpy as np, xlwings as xw
-import dataset
+# import dataset
 
 from log_conf import logger as log, logs_folder
 
@@ -27,7 +27,7 @@ expected_data_cols = dict(
     decimal='GST 1,PST-3,HST,JST,KST'.split(','),
     other='Comment'.split(),
 )
-expected_data_cols_all = [col for col_grp in expected_data_cols.values() for col in col_grp]
+expected_data_cols_all = lambda: [col for col_grp in expected_data_cols.values() for col in col_grp]
 
 
 def get_parsed_attachments_table() -> pd.DataFrame:
@@ -45,40 +45,76 @@ def match_mock_email(From: str, To: str, Subject: str, attached_filenames: list[
     if ('jon' in From.lower() and
             'jon' in To.lower() and
             'outlook' in Subject.lower() and 'extract' in Subject.lower()):
-        matched_attachments = [a for a in attached_filenames if ('mock' in a.lower() and 'attach' in a.lower()
-                                                                 and '.xls' in a.lower())]  # matches xls, xlsx, xlsm, xlsb
+        matched_attachments = [a for a in attached_filenames
+                               if ('mock' in a.lower() and 'attach' in a.lower()
+                               and '.xls' in a.lower())]  # matches xls, xlsx, xlsm, xlsb
         return matched_attachments
 
 
 def parse_mock_attachment_xls(attachment_name: str, attachment_temp_filename: Path) -> pd.DataFrame:
 
-    attach_data = pd.read_excel(
-        attachment_temp_filename,
-        parse_dates=['Date'],
-        dtype={meta: str for meta in (expected_data_cols['meta'] + expected_data_cols['other'])},
-        ).assign(
-        Comment=lambda d: d.Comment.fillna('').astype(str)  # otherwise dataset creates as a float column
-    )
+    data_sheets = 'Sheet1,Summary,'.split(',')
+
+    with pd.ExcelFile(attachment_temp_filename) as xls:
+        attach_data = pd.concat([
+            pd.read_excel(xls,
+                          sheet_name=sheet_name,
+                          parse_dates=['Date'],
+                          dtype={meta: str for meta in (expected_data_cols['meta'] + expected_data_cols['other'])},
+                          )
+            .assign(Comment=lambda d: (d.Comment.fillna('').astype(str) if 'Comment' in d else '')
+                    )  # otherwise dataset creates as a float column
+            for sheet_name in data_sheets if sheet_name in xls.sheet_names
+        ])
 
     # check data consistency
+
+    # rename some known column synonyms
+    attach_data.rename(columns={
+        'GST': 'GST 1',
+        'PST': 'PST-3',
+        'hst': 'HST',
+        'JST 1': 'JST',
+    }, inplace=True)
+    if 'KST' not in attach_data:
+        expected_data_cols['decimal'] = 'GST 1,PST-3,HST,JST'.split(',')
+
     #   eg. expected columns exist
-    assert all(col in attach_data for col in expected_data_cols_all)
+    assert all(col in attach_data for col in expected_data_cols_all())
+
+    # drop rows where emailID is na
+    attach_data.dropna(subset='emailID gender ip_address'.split(), how='all', inplace=True)
+
     #   eg. Date col is parsed as a date
     assert 'datetime' in str(attach_data['Date'].dtype)
     # strip all strings, slow because applies func to each element
     attach_data.applymap(lambda x: x.strip() if isinstance(x, str) else x)
-    #   eg. that input data has unique (Date, emailID)
+
+    # uppercase these fields
+    attach_data['emailID gender ip_address'.split()] = \
+        attach_data['emailID gender ip_address'.split()].apply(lambda x: x.str.upper())
+
+    #   check that input data has unique (Date, emailID)
     if attach_data.duplicated('Date emailID'.split()).any():
-        err_msg = f'data error, duplicate rows in {attachment_name}'
-        log.error(err_msg)
-        raise ValueError(err_msg)
+        err_msg = f'data error, duplicate rows in {attachment_name}\n' \
+                  + attach_data[attach_data.duplicated('Date emailID'.split(), keep=False)].to_string()
 
-    # use external key to map to row of ParsedEmails-> ParseTimestampUTC From Subject ReceivedTime Attachment
-    # don't insert duplicate data rows (ignoring ParseTimestampUTC)
-    #   Declare a unique constraint? on (<list of columns>).
+        log.warning(err_msg)
+        #raise ValueError(err_msg)
 
-    # change column names to non-reserved names
-    attach_data = (attach_data[expected_data_cols_all]
+        # aggregate duplicated rows
+        attach_data = (attach_data
+                       .groupby('Date emailID'.split(), as_index=False)
+                       .agg(dict(**{c: lambda x: ','.join((str(x) if pd.notna(x) else '') for x in x.unique())
+                                    for c in 'first_name last_name gender ip_address Comment'.split()},
+                                 **{c: 'sum' for c in expected_data_cols['decimal']},)
+                            )
+                       )[expected_data_cols_all()]
+
+    attach_data = (attach_data
+                   # select all columns up to Comment rather than all columns [expected_data_cols_all()]
+                   [attach_data.columns.tolist()[:attach_data.columns.tolist().index('Comment')+1]]
+                   # change column names to non-reserved names
                    .rename(columns=lambda x: x.replace('-', '_').replace('.', '_').replace(' ', '_'))
                    .rename(columns={'Date': 'txDate'})
                    )
@@ -129,7 +165,8 @@ def parse_each_mock_attachment(mailitem, attachment_name: str, attachment_temp_f
 
                     # log.debug(f'data row txDate {row["txDate"]:%Y-%m-%d} {row["emailID"]} already exist')
                     if not ( all(data_exist[meta] == row[meta]
-                                 for meta in attach_data.select_dtypes(exclude='number').columns)
+                                 for meta in [x for x in attach_data.select_dtypes(exclude='number').columns
+                                              if x not in 'ip_address Comment'.split()])
                          and all(round(data_exist[num], 2) == round(row[num], 2)
                                  for num  in attach_data.select_dtypes(include='number').columns)
                     ):
@@ -243,3 +280,9 @@ if __name__ == '__main__':
     parsed_attach_data.loc[parsed_attach_data.groupby('txDate emailID'.split())['ParseTimestampUTC'].idxmax()]\
         .to_csv(save_attachments_temp.parent / f'parsed_data_{datetime.now():%Y-%m-%d_%H%M%S}.csv',
                 index=False)
+
+    summary_file = Path(r'C:\temp') / f'Summary_data_{datetime.now():%Y-%m-%d_%H%M%S}.csv'
+    # save to file only most recent revision of each row
+    parsed_attach_data.loc[parsed_attach_data.groupby('txDate emailID'.split())['ParseTimestampUTC'].idxmax()]\
+        .to_csv(summary_file, index=False)
+    log.info(summary_file)
